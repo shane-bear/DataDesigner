@@ -41,6 +41,7 @@ from data_designer.engine.models.facade import ModelFacade
 from data_designer.engine.models.registry import ModelRegistry
 from data_designer.engine.models.request_admission.controller import AdaptiveRequestAdmissionController
 from data_designer.engine.secret_resolver import SecretResolver
+from data_designer.integrations.external_history_seeds import binding_from_messages
 
 
 class CallBlocked(DataDesignerError):
@@ -205,6 +206,11 @@ class CallReceipts:
             body = asdict(request)
             body.pop("extra_headers", None)  # Authorization/custom headers never enter receipts.
             reason = None
+            binding = None
+            try:
+                binding = binding_from_messages(request.messages)
+            except ValueError:
+                reason = "invalid_work_binding"
             if request.model != self.policy.model_id:
                 reason = "model_mismatch"
             elif type(request.max_tokens) is not int or not 0 < request.max_tokens <= self.policy.max_output_tokens:
@@ -222,7 +228,9 @@ class CallReceipts:
             if reason is not None:
                 self._append({"kind": "rejected", "request_id": request_id, "reason": reason})
                 raise CallBlocked(reason)
-            self._append({"kind": "reserved", "request_id": request_id, "request": body})
+            self._append(
+                {"kind": "reserved", "request_id": request_id, "request": body, "declared_work_binding": binding}
+            )
             return request_id
 
     def uncertain(self, request_id: str, reason: str, *, error: dict[str, Any] | None = None) -> None:
