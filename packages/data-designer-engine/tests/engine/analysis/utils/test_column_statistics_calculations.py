@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 from itertools import cycle
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -18,6 +20,12 @@ from data_designer.config.analysis.column_statistics import (
 )
 from data_designer.config.column_configs import LLMTextColumnConfig
 from data_designer.config.run_config import JinjaRenderingEngine
+from data_designer.engine.analysis.column_profilers.base import ColumnConfigWithDataFrame
+from data_designer.engine.analysis.column_statistics import get_column_statistics_calculator
+from data_designer.engine.utils.token_counting import count_text_tokens
+
+if TYPE_CHECKING:
+    pass
 from data_designer.config.utils.numerical_helpers import prepare_number_for_reporting
 from data_designer.engine.analysis.utils.column_statistics_calculations import (
     calculate_column_distribution,
@@ -392,3 +400,89 @@ def test_calculate_general_column_info_edge_cases():
     assert result["num_records"] == 0
     assert result["num_null"] == 0
     assert result["simple_dtype"] == MissingValue.CALCULATION_FAILED
+
+
+@pytest.mark.parametrize("backend", ["object", "pyarrow"], ids=["object", "arrow"])
+@pytest.mark.parametrize("size", [0, 1, 2], ids=["empty", "singleton", "pair"])
+def test_output_token_statistics_missing_sample_deviation(backend: str, size: int) -> None:
+    config = LLMTextColumnConfig(name="response", model_alias="test-model", prompt="Prompt", system_prompt="System")
+    texts = ["short", "a longer response with more tokens"][:size]
+    frame = lazy.pd.DataFrame({"response": lazy.pd.Series(texts, dtype=object)})
+    frame = frame.convert_dtypes(dtype_backend="pyarrow") if backend == "pyarrow" else frame.astype(object)
+    original = frame.copy(deep=True)
+    result = calculate_output_token_stats(config, frame)
+    if size == 0:
+        assert all(value == MissingValue.CALCULATION_FAILED for value in result.values())
+    else:
+        counts = lazy.np.array([count_text_tokens(text) for text in texts])
+        assert result["output_tokens_mean"] == pytest.approx(float(counts.mean()))
+        assert result["output_tokens_median"] == pytest.approx(float(lazy.np.median(counts)))
+        if size == 1:
+            assert result["output_tokens_stddev"] == MissingValue.CALCULATION_FAILED
+        else:
+            assert result["output_tokens_stddev"] == pytest.approx(float(counts.std(ddof=1)))
+    lazy.pd.testing.assert_frame_equal(frame, original)
+    stats = get_column_statistics_calculator(config.column_type)(
+        column_config_with_df=ColumnConfigWithDataFrame(column_config=config, df=frame)
+    ).calculate()
+    json.dumps(stats.model_dump(mode="json"), allow_nan=False)
+    if size < 2:
+        assert stats.output_tokens_stddev == MissingValue.CALCULATION_FAILED
+
+
+@pytest.mark.parametrize("engine", [JinjaRenderingEngine.SECURE, JinjaRenderingEngine.NATIVE], ids=["secure", "native"])
+@pytest.mark.parametrize(
+    "literal", ['{"x":[1,true]}', "null", "{{ unresolved }} 值\\quoted\n"], ids=["json", "scalar", "literal"]
+)
+def test_input_token_statistics_match_generation_deserialization(engine: JinjaRenderingEngine, literal: str) -> None:
+    system = "Original system text"
+    config = LLMTextColumnConfig(
+        name="response",
+        model_alias="test-model",
+        system_prompt="{{ system_seed.text }}",
+        prompt="{{ prompt_seed.text }}",
+    )
+    frame = lazy.pd.DataFrame(
+        {
+            "system_seed": [json.dumps({"text": system}, ensure_ascii=False)],
+            "prompt_seed": [json.dumps({"text": literal}, ensure_ascii=False)],
+            "response": ["Saved response"],
+        }
+    ).convert_dtypes(dtype_backend="pyarrow")
+    original = frame.copy(deep=True)
+    result = calculate_input_token_stats(config, frame, jinja_rendering_engine=engine)
+    expected = float(count_text_tokens(system + "\n\n" + literal))
+    assert result["input_tokens_mean"] == expected
+    assert result["input_tokens_median"] == expected
+    assert result["input_tokens_stddev"] == 0.0
+    lazy.pd.testing.assert_frame_equal(frame, original)
+
+
+def test_input_token_statistics_empty_population_is_missing() -> None:
+    config = LLMTextColumnConfig(name="response", model_alias="test-model", prompt="Prompt", system_prompt="System")
+    result = calculate_input_token_stats(config, lazy.pd.DataFrame({"response": lazy.pd.Series([], dtype=object)}))
+    assert all(value == MissingValue.CALCULATION_FAILED for value in result.values())
+
+
+@pytest.mark.parametrize("backend", ["object", "pyarrow"], ids=["object", "arrow"])
+@pytest.mark.parametrize(
+    ("values", "expected_unique"),
+    [
+        ([1, None, 3, None, 5], 3),
+        (["a", None, "a", "b", None], 2),
+        ([[1], None, [1], [2], None], 2),
+        ([{"a": 1}, None, {"a": 1}, {"a": 2}, None], 2),
+    ],
+    ids=["numbers", "strings", "lists", "objects"],
+)
+def test_general_column_statistics_preserve_null_mask(backend: str, values: list[object], expected_unique: int) -> None:
+    if backend == "pyarrow":
+        frame = lazy.pa.Table.from_pydict({"value": values}).to_pandas(types_mapper=lazy.pd.ArrowDtype)
+    else:
+        frame = lazy.pd.DataFrame({"value": lazy.pd.Series(values, dtype=object)})
+    original = frame.copy(deep=True)
+    result = calculate_general_column_info("value", frame)
+    assert result["num_records"] == 5
+    assert result["num_null"] == 2
+    assert result["num_unique"] == expected_unique
+    lazy.pd.testing.assert_frame_equal(frame, original)

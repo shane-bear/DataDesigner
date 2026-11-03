@@ -23,6 +23,7 @@ from data_designer.engine.column_generators.utils.prompt_renderer import (
     RecordBasedPromptRenderer,
     create_response_recipe,
 )
+from data_designer.engine.processing.utils import deserialize_json_values
 from data_designer.engine.utils.token_counting import count_text_tokens
 
 if TYPE_CHECKING:
@@ -61,7 +62,8 @@ def calculate_column_distribution(
 
 def calculate_general_column_info(column_name: str, df: pd.DataFrame) -> dict[str, Any]:
     try:
-        _df = lazy.pd.DataFrame(df[column_name].apply(ensure_hashable))
+        column = df[column_name]
+        hashable_values = column.dropna().apply(ensure_hashable)
 
         if has_pyarrow_backend(df):
             pyarrow_dtype = str(df[column_name].dtype.pyarrow_dtype)
@@ -78,9 +80,9 @@ def calculate_general_column_info(column_name: str, df: pd.DataFrame) -> dict[st
         return {
             "pyarrow_dtype": pyarrow_dtype,
             "simple_dtype": simple_dtype,
-            "num_records": len(_df[column_name]),
-            "num_null": _df[column_name].isnull().sum(),
-            "num_unique": _df[column_name].nunique(),
+            "num_records": len(column),
+            "num_null": column.isnull().sum(),
+            "num_unique": hashable_values.nunique(),
         }
     except Exception as e:
         logger.warning(f"{WARNING_PREFIX} failed to calculate general column info for '{column_name}': {e}")
@@ -107,6 +109,7 @@ def calculate_input_token_stats(
             jinja_rendering_engine=jinja_rendering_engine,
         )
         for record in df.sample(num_samples, random_state=RANDOM_SEED).to_dict(orient="records"):
+            record = deserialize_json_values(record)
             system_prompt = renderer.render(
                 prompt_template=column_config.system_prompt, record=record, prompt_type=PromptType.SYSTEM_PROMPT
             )
@@ -117,6 +120,12 @@ def calculate_input_token_stats(
             num_tokens.append(count_text_tokens(concatenated_prompt))
     except Exception as e:
         logger.warning(f"{WARNING_PREFIX} failed to calculate input token stats for column {column_config.name!r}: {e}")
+        return {
+            "input_tokens_mean": MissingValue.CALCULATION_FAILED,
+            "input_tokens_median": MissingValue.CALCULATION_FAILED,
+            "input_tokens_stddev": MissingValue.CALCULATION_FAILED,
+        }
+    if not num_tokens:
         return {
             "input_tokens_mean": MissingValue.CALCULATION_FAILED,
             "input_tokens_median": MissingValue.CALCULATION_FAILED,
@@ -134,10 +143,14 @@ def calculate_output_token_stats(
 ) -> dict[str, float | MissingValue]:
     try:
         tokens_per_record = df[column_config.name].apply(lambda value: count_text_tokens(str(value)))
-        return {
+        statistics = {
             "output_tokens_mean": tokens_per_record.mean(),
             "output_tokens_median": tokens_per_record.median(),
             "output_tokens_stddev": tokens_per_record.std(),
+        }
+        return {
+            name: MissingValue.CALCULATION_FAILED if lazy.pd.isna(value) else value
+            for name, value in statistics.items()
         }
     except Exception as e:
         logger.warning(f"{WARNING_PREFIX} failed to calculate output token stats for column {column_config.name}: {e}")
